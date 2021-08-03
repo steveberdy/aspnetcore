@@ -42,7 +42,7 @@ namespace Templates.Test.Helpers
         public string RuntimeIdentifier { get; set; } = string.Empty;
         public static DevelopmentCertificate DevCert { get; } = DevelopmentCertificate.Create(AppContext.BaseDirectory);
 
-        public string TemplateBuildDir => Path.Combine(TemplateOutputDir, "bin", "Debug", TargetFramework, RuntimeIdentifier);
+        public string TemplateBuildDir => Path.Combine(TemplateOutputDir, "bin", "Release", TargetFramework, RuntimeIdentifier);
         public string TemplatePublishDir => Path.Combine(TemplateOutputDir, "bin", "Release", TargetFramework, RuntimeIdentifier, "publish");
 
         public ITestOutputHelper Output { get; set; }
