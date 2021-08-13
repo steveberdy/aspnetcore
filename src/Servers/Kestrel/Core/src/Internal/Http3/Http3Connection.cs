@@ -176,38 +176,64 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
                 return;
             }
 
-            UpdateStartingStreams(now);
+            UpdateStreamTimeouts(now);
         }
 
-        private void UpdateStartingStreams(DateTimeOffset now)
+        private void UpdateStreamTimeouts(DateTimeOffset now)
         {
+            // This method checks for timeouts:
+            // 1. When a stream first starts and waits to receive headers.
+            //    Uses RequestHeadersTimeout.
+            // 2. When a stream finished and is waiting for underlying transport to drain.
+            //    Uses MinResponseDataRate.
+
             var ticks = now.Ticks;
 
             lock (_streams)
             {
                 foreach (var stream in _streams.Values)
                 {
-                    if (stream.ReceivedHeader)
+                    if (stream.IsReceivingHeader)
                     {
-                        continue;
-                    }
-
-                    if (stream.HeaderTimeoutTicks == default)
-                    {
-                        // On expiration overflow, use max value.
-                        var expirationTicks = ticks + _context.ServiceContext.ServerOptions.Limits.RequestHeadersTimeout.Ticks;
-                        stream.HeaderTimeoutTicks = expirationTicks >= 0 ? expirationTicks : long.MaxValue;
-                    }
-
-                    if (stream.HeaderTimeoutTicks < ticks)
-                    {
-                        if (stream.IsRequestStream)
+                        if (stream.StreamTimeoutTicks == default)
                         {
-                            stream.Abort(new ConnectionAbortedException(CoreStrings.BadRequest_RequestHeadersTimeout), Http3ErrorCode.RequestRejected);
+                            // On expiration overflow, use max value.
+                            var expirationTicks = ticks + _context.ServiceContext.ServerOptions.Limits.RequestHeadersTimeout.Ticks;
+                            stream.StreamTimeoutTicks = expirationTicks >= 0 ? expirationTicks : long.MaxValue;
                         }
-                        else
+
+                        if (stream.StreamTimeoutTicks < ticks)
                         {
-                            stream.Abort(new ConnectionAbortedException(CoreStrings.Http3ControlStreamHeaderTimeout), Http3ErrorCode.StreamCreationError);
+                            if (stream.IsRequestStream)
+                            {
+                                stream.Abort(new ConnectionAbortedException(CoreStrings.BadRequest_RequestHeadersTimeout), Http3ErrorCode.RequestRejected);
+                            }
+                            else
+                            {
+                                stream.Abort(new ConnectionAbortedException(CoreStrings.Http3ControlStreamHeaderTimeout), Http3ErrorCode.StreamCreationError);
+                            }
+                        }
+                    }
+                    else if (stream.IsDraining)
+                    {
+                        var minDataRate = _context.ServiceContext.ServerOptions.Limits.MinResponseDataRate;
+                        if (minDataRate == null)
+                        {
+                            continue;
+                        }
+
+                        if (stream.StreamTimeoutTicks == default)
+                        {
+                            var expirationTicks = Math.Max(
+                                _context.TimeoutControl.GetWriteTimingTimeoutTimestamp(),
+                                ticks + minDataRate.GracePeriod.Ticks);
+
+                            stream.StreamTimeoutTicks = expirationTicks >= 0 ? expirationTicks : long.MaxValue;
+                        }
+
+                        if (stream.StreamTimeoutTicks < ticks)
+                        {
+                            stream.Abort(new ConnectionAbortedException(CoreStrings.ConnectionTimedBecauseResponseMininumDataRateNotSatisfied), Http3ErrorCode.RequestCancelled);
                         }
                     }
                 }
@@ -396,7 +422,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
                     }
 
                     _context.TimeoutControl.CancelTimeout();
-                    _context.TimeoutControl.StartDrainTimeout(Limits.MinResponseDataRate, Limits.MaxResponseBufferSize);
                 }
                 catch
                 {
@@ -648,7 +673,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
 
         void IHttp3StreamLifetimeHandler.OnStreamHeaderReceived(IHttp3Stream stream)
         {
-            Debug.Assert(stream.ReceivedHeader);
+            Debug.Assert(!stream.IsReceivingHeader);
         }
 
         public void HandleRequestHeadersTimeout()

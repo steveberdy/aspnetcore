@@ -889,7 +889,7 @@ namespace Interop.FunctionalTests.Http3
 
                     // This message says the client closed the connection because the server
                     // sends a GOAWAY and the client then closes the connection once all requests are finished.
-                    Assert.Contains("The client closed the connection.", connectionAbortLog.Message);
+                    Assert.Contains("The client closed the HTTP/3 connection.", connectionAbortLog.Message);
                     return true;
                 }, "Wait for connection abort.");
 

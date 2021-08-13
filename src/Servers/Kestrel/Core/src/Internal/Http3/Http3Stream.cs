@@ -1,20 +1,15 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-using System;
 using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Net.Http;
 using System.Net.Http.QPack;
-using System.Net.Quic;
 using System.Runtime.CompilerServices;
-using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Hosting.Server;
-using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Infrastructure;
 using Microsoft.Extensions.Logging;
@@ -73,8 +68,9 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
         public KestrelServerLimits Limits => _context.ServiceContext.ServerOptions.Limits;
         public long StreamId => _streamIdFeature.StreamId;
 
-        public long HeaderTimeoutTicks { get; set; }
-        public bool ReceivedHeader => _appCompleted != null; // TCS is assigned once headers are received
+        public long StreamTimeoutTicks { get; set; }
+        public bool IsReceivingHeader => _appCompleted == null; // TCS is assigned once headers are received
+        public bool IsDraining => _appCompleted?.Task.IsCompleted ?? false; // Draining starts once app is complete
 
         public bool IsRequestStream => true;
 
@@ -97,7 +93,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             _totalParsedHeaderSize = 0;
             _isMethodConnect = false;
             _completionState = default;
-            HeaderTimeoutTicks = 0;
+            StreamTimeoutTicks = 0;
 
             if (_frameWriter == null)
             {
@@ -409,7 +405,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
                 return true;
             }
 
-            // TODO make this actually close the Http3Stream by telling quic to close the stream.
             return false;
         }
 
@@ -501,12 +496,21 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
                 }
                 finally
                 {
-                    ApplyCompletionFlag(StreamCompletionFlags.Completed);
+                    // Completing the stream needs to happen in the middle of DisposeAsync.
+                    // After the stream has drained but before the stream is returned to the pool.
+                    // OnCompleted callback executes in the right place.
+                    _context.StreamContext.Features.Get<IConnectionCompleteFeature>()!.OnCompleted(static (state) =>
+                    {
+                        var s = (Http3Stream)state;
 
-                    // Tells the connection to remove the stream from its active collection.
-                    _context.StreamLifetimeHandler.OnStreamCompleted(this);
+                        s.ApplyCompletionFlag(StreamCompletionFlags.Completed);
 
-                    // Dispose must happen after stream is no longer active.
+                        // Tells the connection to remove the stream from its active collection.
+                        s._context.StreamLifetimeHandler.OnStreamCompleted(s);
+
+                        return Task.CompletedTask;
+                    }, this);
+
                     await _context.StreamContext.DisposeAsync();
                 }
             }
@@ -600,8 +604,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
                 case RequestHeaderParsingState.Headers:
                     break;
                 case RequestHeaderParsingState.Trailers:
-                    // trailers
-                    // TODO figure out if there is anything else to do here.
                     return;
                 default:
                     Debug.Fail("Unexpected header parsing state.");
@@ -627,6 +629,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             }
 
             _appCompleted = new TaskCompletionSource();
+            StreamTimeoutTicks = default;
             _context.StreamLifetimeHandler.OnStreamHeaderReceived(this);
 
             ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
